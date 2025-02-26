@@ -1,5 +1,5 @@
 import https from 'https';
-import fs from 'fs';
+import { TOKEN } from './env'
 
 // Configuration parameters
 const GITLAB_URL: string = 'https://git.yuaiweiwu.com';  // Replace with your GitLab domain
