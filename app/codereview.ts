@@ -4,7 +4,7 @@ import axios from 'axios';
 
 const GITLAB_URL: string = 'https://git.yuaiweiwu.com';
 const PROJECT_ID: string = '165';
-const MR_IID: string = '8';
+const MR_IID: string = '9';
 
 const url: string = `${GITLAB_URL}/api/v4/projects/${PROJECT_ID}/merge_requests/${MR_IID}/changes`;
 
@@ -27,6 +27,7 @@ interface CommentBody {
     head_sha: string;
     position_type: 'text';
     new_path: string;
+    old_path: string;
     new_line: number;
   };
 }
@@ -88,6 +89,7 @@ async function processMergeRequest(refs, diffs: Diff[]): Promise<void> {
           head_sha: refs.head_sha,  // Need MR version info
           position_type: 'text',
           new_path: diff.new_path,
+          old_path: diff.old_path,
           new_line: 10    // Comment on first line; adjust as needed
         }
       };
@@ -100,8 +102,8 @@ async function processMergeRequest(refs, diffs: Diff[]): Promise<void> {
           console.log('AI Result', text);
           console.log('所有评论已成功添加');
         });
-        index++;
       }
+      index++;
     }
 
   } catch (error) {
@@ -151,8 +153,12 @@ async function getAISuggestions(code) {
 
         ${code}
 
-        请基于上述要求进行审查，请反馈出最重要的几个问题（最好不超过3个点），不需要针对以上规则一一分析。
-        另外用中文回复，并且不需要回复修改后的代码
+        请基于上述要求进行审查，。
+        回复格式要求：
+        1. 另外用中文简体回复，并且不需要回复修改后的代码
+        2. 针对发现的问题，请按照以下格式来列出问题和说明：第几行代码存在什么问题以及建议如何修改
+        3. 请反馈出最重要的几个问题（最好不超过3个点），不需要针对以上规则一一分析
+        4. 不需要列出最终的代码，只需要列出问题和建议即可
       `,
       }]
     }
@@ -176,7 +182,7 @@ async function getAISuggestions(code) {
 
 function postComment(comment: CommentBody): Promise<void> {
   return new Promise((resolve, reject) => {
-    const url: string = `${GITLAB_URL}/api/v4/projects/${PROJECT_ID}/merge_requests/${MR_IID}/notes`;
+    const url: string = `${GITLAB_URL}/api/v4/projects/${PROJECT_ID}/merge_requests/${MR_IID}/discussions`;
     const options: https.RequestOptions = {
       method: 'POST',
       headers: {
