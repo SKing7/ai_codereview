@@ -12,9 +12,11 @@ git commit -m "Encrypt app/env.ts and docker-compose.yml"
 git push
 ```
 
-## 导出密钥
+## 密钥使用
 ```
 git-crypt export-key keyfile
+git-crypt lock
+git-crypt unlock keyfile
 ```
 ## 构建
 
