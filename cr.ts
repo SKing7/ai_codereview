@@ -1,15 +1,12 @@
 import https from 'https';
 import { TOKEN } from './env'
 
-// Configuration parameters
-const GITLAB_URL: string = 'https://git.yuaiweiwu.com';  // Replace with your GitLab domain
-const PROJECT_ID: string = '165';                        // Replace with your project ID
-const MR_IID: string = '8';                             // Replace with your Merge Request IID
+const GITLAB_URL: string = 'https://git.yuaiweiwu.com';
+const PROJECT_ID: string = '165';
+const MR_IID: string = '8';
 
-// Construct the API URL
 const url: string = `${GITLAB_URL}/api/v4/projects/${PROJECT_ID}/merge_requests/${MR_IID}/changes`;
 
-// HTTP request options
 const options: https.RequestOptions = {
   headers: {
     'PRIVATE-TOKEN': TOKEN
