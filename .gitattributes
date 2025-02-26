@@ -1,2 +1,2 @@
-app/env.ts secret filter=git-crypt diff=git-crypt
-docker-compose.yml secret filter=git-crypt diff=git-crypt
+app/env.ts filter=git-crypt diff=git-crypt
+docker-compose.yml filter=git-crypt diff=git-crypt
