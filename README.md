@@ -13,3 +13,4 @@ curl --location 'http://localhost:4000/v1/chat/completions' \
 --header 'Authorization: sk-123456' \
 --data '{"model":"grok-3","messages":[{"content": "实现一个快排"}]}'
 ```
+# grok_api
