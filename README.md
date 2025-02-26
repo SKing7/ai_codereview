@@ -2,9 +2,19 @@
 
 ## Install
 
-```
+```shell
 brew install git-crypt gpg
+git-crypt status
 
+# 查看是否已经加密
+
+git commit -m "Encrypt app/env.ts and docker-compose.yml"
+git push
+```
+
+## 导出密钥
+```
+git-crypt export-key keyfile
 ```
 ## 构建
 
