@@ -1,5 +1,11 @@
 基于 grok_API 实现对 Merge Request 进行 Code Review
 
+## Install
+
+```
+brew install git-crypt gpg
+
+```
 ## 构建
 
 ```bash
