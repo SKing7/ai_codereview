@@ -3,7 +3,15 @@
 ## 构建
 
 ```bash
-docker-compose up --build
+docker build --no-cache -t grok/api .
+
+docker-compose up
+```
+
+# AI Code Review
+
+```shell
+npx tsx app/code_review.ts
 ```
 
 ## Test Grok APi
@@ -15,8 +23,3 @@ curl --location 'http://localhost:4000/v1/chat/completions' \
 --data '{"model":"grok-3","messages":[{"content": "实现一个快排"}]}'
 ```
 
-# AI Code Review
-
-```
-npx tsx cr.ts
-```
