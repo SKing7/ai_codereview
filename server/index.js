@@ -23,7 +23,19 @@ const CONFIG = {
     "grok-3-reasoning": "grok-3",
   },
   API: {
-    IS_CUSTOM_SSO: process.env.IS_CUSTOM_SSO === "true",
+    IS_TEMP_CONVERSATION:
+      process.env.IS_TEMP_CONVERSATION == undefined
+        ? false
+        : process.env.IS_TEMP_CONVERSATION == "true",
+    IS_TEMP_GROK2:
+      process.env.IS_TEMP_GROK2 == undefined
+        ? true
+        : process.env.IS_TEMP_GROK2 == "true",
+    GROK2_CONCURRENCY_LEVEL: process.env.GROK2_CONCURRENCY_LEVEL || 4,
+    IS_CUSTOM_SSO:
+      process.env.IS_CUSTOM_SSO == undefined
+        ? false
+        : process.env.IS_CUSTOM_SSO == "true",
     BASE_URL: "https://grok.com",
     API_KEY: process.env.API_KEY || "sk-123456",
     SIGNATURE_COOKIE: null,
@@ -38,15 +50,22 @@ const CONFIG = {
   RETRY: {
     MAX_ATTEMPTS: 2, //重试次数
   },
-  SHOW_THINKING: process.env.SHOW_THINKING === "true",
+  SHOW_THINKING:
+    process.env.SHOW_THINKING == undefined
+      ? true
+      : process.env.SHOW_THINKING == "true",
   IS_THINKING: false,
   IS_IMG_GEN: false,
   IS_IMG_GEN2: false,
-  SSO_INDEX: 0, //sso的索引
-  ISSHOW_SEARCH_RESULTS: process.env.ISSHOW_SEARCH_RESULTS === "true", //是否显示搜索结果
-  CHROME_PATH: process.env.CHROME_PATH || "/usr/bin/chromium", //chrome路径
+  TEMP_COOKIE_INDEX: 0, //临时cookie的下标
+  ISSHOW_SEARCH_RESULTS:
+    process.env.ISSHOW_SEARCH_RESULTS == undefined
+      ? true
+      : process.env.ISSHOW_SEARCH_RESULTS == "true", //是否显示搜索结果
+  CHROME_PATH: process.env.CHROME_PATH || null,
 };
 puppeteer.use(StealthPlugin());
+
 // 请求头配置
 const DEFAULT_HEADERS = {
   accept: "*/*",
@@ -69,214 +88,451 @@ const DEFAULT_HEADERS = {
 };
 
 async function initialization() {
+  if (CONFIG.CHROME_PATH == null) {
+    try {
+      CONFIG.CHROME_PATH = puppeteer.executablePath();
+    } catch (error) {
+      CONFIG.CHROME_PATH = "/usr/bin/chromium";
+    }
+  }
+  Logger.info(`CHROME_PATH: ${CONFIG.CHROME_PATH}`, "Server");
   if (CONFIG.API.IS_CUSTOM_SSO) {
-    await Utils.get_signature();
+    if (CONFIG.API.IS_TEMP_GROK2) {
+      await tempCookieManager.ensureCookies();
+    }
     return;
   }
   const ssoArray = process.env.SSO.split(",");
-  ssoArray.forEach((sso) => {
-    tokenManager.addToken(`sso-rw=${sso};sso=${sso}`);
-  });
-  console.log(JSON.stringify(tokenManager.getActiveTokens(), null, 2));
-  await Utils.get_signature();
+  const concurrencyLimit = 3;
+  for (let i = 0; i < ssoArray.length; i += concurrencyLimit) {
+    const batch = ssoArray.slice(i, i + concurrencyLimit);
+    const batchPromises = batch.map((sso) =>
+      tokenManager.addToken(`sso-rw=${sso};sso=${sso}`)
+    );
+
+    await Promise.all(batchPromises);
+    Logger.info(`已加载令牌: ${i} 个`, "Server");
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  Logger.info(
+    `令牌加载完成: ${JSON.stringify(tokenManager.getAllTokens(), null, 2)}`,
+    "Server"
+  );
+  Logger.info(`共加载: ${tokenManager.getAllTokens().length}个令牌`, "Server");
+  if (CONFIG.API.IS_TEMP_GROK2) {
+    await tempCookieManager.ensureCookies();
+    CONFIG.API.TEMP_COOKIE =
+      tempCookieManager.cookies[tempCookieManager.currentIndex];
+  }
   Logger.info("初始化完成", "Server");
 }
 
 class AuthTokenManager {
   constructor() {
-    this.activeTokens = [];
-    this.expiredTokens = new Map();
-    this.tokenModelFrequency = new Map();
-    this.modelRateLimit = {
-      "grok-3": { RequestFrequency: 20 },
-      "grok-3-deepsearch": { RequestFrequency: 5 },
-      "grok-3-reasoning": { RequestFrequency: 5 },
+    this.tokenModelMap = {};
+    this.expiredTokens = new Set();
+    this.tokenStatusMap = {};
+
+    // 定义模型请求频率限制和过期时间
+    this.modelConfig = {
+      "grok-2": {
+        RequestFrequency: 30,
+        ExpirationTime: 1 * 60 * 60 * 1000, // 1小时
+      },
+      "grok-3": {
+        RequestFrequency: 20,
+        ExpirationTime: 2 * 60 * 60 * 1000, // 2小时
+      },
+      "grok-3-deepsearch": {
+        RequestFrequency: 10,
+        ExpirationTime: 24 * 60 * 60 * 1000, // 24小时
+      },
+      "grok-3-reasoning": {
+        RequestFrequency: 10,
+        ExpirationTime: 24 * 60 * 60 * 1000, // 24小时
+      },
     };
+    this.tokenResetSwitch = false;
+    this.tokenResetTimer = null;
   }
-
-  addToken(token) {
-    if (!this.activeTokens.includes(token)) {
-      this.activeTokens.push(token);
-      this.tokenModelFrequency.set(token, {
-        "grok-3": 0,
-        "grok-3-deepsearch": 0,
-        "grok-3-reasoning": 0,
-      });
+  async fetchGrokStats(token, modelName) {
+    let requestKind = "DEFAULT";
+    if (modelName == "grok-2" || modelName == "grok-3") {
+      requestKind = "DEFAULT";
+    } else if (modelName == "grok-3-deepsearch") {
+      requestKind = "DEEPSEARCH";
+    } else if (modelName == "grok-3-reasoning") {
+      requestKind = "REASONING";
     }
-  }
-  setToken(token) {
-    this.activeTokens = [token];
-    this.tokenModelFrequency.set(token, {
-      "grok-3": 0,
-      "grok-3-deepsearch": 0,
-      "grok-3-reasoning": 0,
+    const response = await fetch("https://grok.com/rest/rate-limits", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Cookie: token,
+      },
+      body: JSON.stringify({
+        requestKind: requestKind,
+        modelName: modelName == "grok-2" ? "grok-latest" : "grok-3",
+      }),
     });
+
+    if (response.status != 200) {
+      return 0;
+    }
+    const data = await response.json();
+    return data.remainingQueries;
   }
+  async addToken(token) {
+    const sso = token.split("sso=")[1].split(";")[0];
 
-  getTokenByIndex(index, model) {
-    if (this.activeTokens.length === 0) {
-      return null;
-    }
-    const token = this.activeTokens[index];
-    this.recordModelRequest(token, model);
-    return token;
-  }
-
-  recordModelRequest(token, model) {
-    if (model === "grok-3-search" || model === "grok-3-imageGen") {
-      model = "grok-3";
-    }
-
-    if (!this.modelRateLimit[model]) return;
-    const tokenFrequency = this.tokenModelFrequency.get(token);
-    if (tokenFrequency && tokenFrequency[model] !== undefined) {
-      tokenFrequency[model]++;
-    }
-    this.checkAndRemoveTokenIfLimitReached(token);
-  }
-  setModelLimit(index, model) {
-    if (model === "grok-3-search" || model === "grok-3-imageGen") {
-      model = "grok-3";
-    }
-    if (!this.modelRateLimit[model]) return;
-    const tokenFrequency = this.tokenModelFrequency.get(
-      this.activeTokens[index]
-    );
-    tokenFrequency[model] = 9999;
-  }
-  isTokenModelLimitReached(index, model) {
-    if (model === "grok-3-search" || model === "grok-3-imageGen") {
-      model = "grok-3";
-    }
-    if (!this.modelRateLimit[model]) return;
-    const token = this.activeTokens[index];
-    const tokenFrequency = this.tokenModelFrequency.get(token);
-
-    if (!tokenFrequency) {
-      return false;
-    }
-    return tokenFrequency[model] >= this.modelRateLimit[model].RequestFrequency;
-  }
-  checkAndRemoveTokenIfLimitReached(token) {
-    const tokenFrequency = this.tokenModelFrequency.get(token);
-    if (!tokenFrequency) return;
-
-    const isLimitReached = Object.keys(tokenFrequency).every(
-      (model) =>
-        tokenFrequency[model] >= this.modelRateLimit[model].RequestFrequency
-    );
-
-    if (isLimitReached) {
-      const tokenIndex = this.activeTokens.indexOf(token);
-      if (tokenIndex !== -1) {
-        this.removeTokenByIndex(tokenIndex);
+    for (const model of Object.keys(this.modelConfig)) {
+      if (!this.tokenModelMap[model]) {
+        this.tokenModelMap[model] = [];
       }
-    }
-  }
+      if (!this.tokenStatusMap[sso]) {
+        this.tokenStatusMap[sso] = {};
+      }
+      const existingTokenEntry = this.tokenModelMap[model].find(
+        (entry) => entry.token === token
+      );
 
-  removeTokenByIndex(index) {
-    if (!this.isRecoveryProcess) {
-      this.startTokenRecoveryProcess();
-    }
-    const token = this.activeTokens[index];
-    this.expiredTokens.set(token, Date.now());
-    this.activeTokens.splice(index, 1);
-    this.tokenModelFrequency.delete(token);
-    Logger.info(`令牌${token}已达到上限，已移除`, "TokenManager");
-  }
+      if (!existingTokenEntry) {
+        try {
+          const remainingQueries = await this.fetchGrokStats(token, model);
 
-  startTokenRecoveryProcess() {
-    if (CONFIG.API.IS_CUSTOM_SSO) return;
-    setInterval(() => {
-      const now = Date.now();
-      for (const [token, expiredTime] of this.expiredTokens.entries()) {
-        if (now - expiredTime >= 2 * 60 * 60 * 1000) {
-          this.tokenModelUsage.set(token, {
-            "grok-3": 0,
-            "grok-3-deepsearch": 0,
-            "grok-3-reasoning": 0,
+          const modelRequestFrequency =
+            this.modelConfig[model].RequestFrequency;
+          const usedRequestCount = modelRequestFrequency - remainingQueries;
+
+          if (usedRequestCount === modelRequestFrequency) {
+            this.expiredTokens.add({
+              token: token,
+              model: model,
+              expiredTime: Date.now(),
+            });
+
+            if (!this.tokenStatusMap[sso][model]) {
+              this.tokenStatusMap[sso][model] = {
+                isValid: false,
+                invalidatedTime: Date.now(),
+                totalRequestCount: Math.max(0, usedRequestCount),
+              };
+            }
+
+            if (!this.tokenResetSwitch) {
+              this.startTokenResetProcess();
+              this.tokenResetSwitch = true;
+            }
+          } else {
+            this.tokenModelMap[model].push({
+              token: token,
+              RequestCount: Math.max(0, usedRequestCount),
+              AddedTime: Date.now(),
+              StartCallTime: null,
+            });
+
+            if (!this.tokenStatusMap[sso][model]) {
+              this.tokenStatusMap[sso][model] = {
+                isValid: true,
+                invalidatedTime: null,
+                totalRequestCount: Math.max(0, usedRequestCount),
+              };
+            }
+          }
+        } catch (error) {
+          this.tokenModelMap[model].push({
+            token: token,
+            RequestCount: 0,
+            AddedTime: Date.now(),
+            StartCallTime: null,
           });
-          this.activeTokens.push(token);
-          this.expiredTokens.delete(token);
-          Logger.info(
-            `令牌${token}已恢复，已添加到可用令牌列表`,
+
+          if (!this.tokenStatusMap[sso][model]) {
+            this.tokenStatusMap[sso][model] = {
+              isValid: true,
+              invalidatedTime: null,
+              totalRequestCount: 0,
+            };
+          }
+
+          Logger.error(
+            `获取模型 ${model} 的统计信息失败: ${error}`,
             "TokenManager"
           );
         }
+        await Utils.delay(200);
       }
-    }, 2 * 60 * 60 * 1000);
+    }
   }
 
-  getTokenCount() {
-    return this.activeTokens.length || 0;
+  setToken(token) {
+    const models = Object.keys(this.modelConfig);
+    this.tokenModelMap = models.reduce((map, model) => {
+      map[model] = [
+        {
+          token,
+          RequestCount: 0,
+          AddedTime: Date.now(),
+          StartCallTime: null,
+        },
+      ];
+      return map;
+    }, {});
+    const sso = token.split("sso=")[1].split(";")[0];
+    this.tokenStatusMap[sso] = models.reduce((statusMap, model) => {
+      statusMap[model] = {
+        isValid: true,
+        invalidatedTime: null,
+        totalRequestCount: 0,
+      };
+      return statusMap;
+    }, {});
   }
 
-  getActiveTokens() {
-    return [...this.activeTokens];
+  async deleteToken(token) {
+    try {
+      const sso = token.split("sso=")[1].split(";")[0];
+      await Promise.all([
+        new Promise((resolve) => {
+          this.tokenModelMap = Object.fromEntries(
+            Object.entries(this.tokenModelMap).map(([model, entries]) => [
+              model,
+              entries.filter((entry) => entry.token !== token),
+            ])
+          );
+          resolve();
+        }),
+
+        new Promise((resolve) => {
+          delete this.tokenStatusMap[sso];
+          resolve();
+        }),
+      ]);
+      Logger.info(`令牌已成功移除: ${token}`, "TokenManager");
+      return true;
+    } catch (error) {
+      Logger.error("令牌删除失败：", error);
+      return false;
+    }
+  }
+  getNextTokenForModel(modelId) {
+    const normalizedModel = this.normalizeModelName(modelId);
+
+    if (
+      !this.tokenModelMap[normalizedModel] ||
+      this.tokenModelMap[normalizedModel].length === 0
+    ) {
+      return null;
+    }
+    const tokenEntry = this.tokenModelMap[normalizedModel][0];
+
+    if (tokenEntry) {
+      if (
+        tokenEntry.StartCallTime === null ||
+        tokenEntry.StartCallTime === undefined
+      ) {
+        tokenEntry.StartCallTime = Date.now();
+      }
+      if (!this.tokenResetSwitch) {
+        this.startTokenResetProcess();
+        this.tokenResetSwitch = true;
+      }
+      tokenEntry.RequestCount++;
+
+      if (
+        tokenEntry.RequestCount >
+        this.modelConfig[normalizedModel].RequestFrequency
+      ) {
+        this.removeTokenFromModel(normalizedModel, tokenEntry.token);
+        const nextTokenEntry = this.tokenModelMap[normalizedModel][0];
+        return nextTokenEntry ? nextTokenEntry.token : null;
+      }
+      const sso = tokenEntry.token.split("sso=")[1].split(";")[0];
+      if (
+        this.tokenStatusMap[sso] &&
+        this.tokenStatusMap[sso][normalizedModel]
+      ) {
+        if (
+          tokenEntry.RequestCount ===
+          this.modelConfig[normalizedModel].RequestFrequency
+        ) {
+          this.tokenStatusMap[sso][normalizedModel].isValid = false;
+          this.tokenStatusMap[sso][normalizedModel].invalidatedTime =
+            Date.now();
+        }
+        this.tokenStatusMap[sso][normalizedModel].totalRequestCount++;
+      }
+      return tokenEntry.token;
+    }
+
+    return null;
+  }
+
+  removeTokenFromModel(modelId, token) {
+    const normalizedModel = this.normalizeModelName(modelId);
+
+    if (!this.tokenModelMap[normalizedModel]) {
+      Logger.error(`模型 ${normalizedModel} 不存在`, "TokenManager");
+      return false;
+    }
+
+    const modelTokens = this.tokenModelMap[normalizedModel];
+    const tokenIndex = modelTokens.findIndex((entry) => entry.token === token);
+
+    if (tokenIndex !== -1) {
+      const removedTokenEntry = modelTokens.splice(tokenIndex, 1)[0];
+      this.expiredTokens.add({
+        token: removedTokenEntry.token,
+        model: normalizedModel,
+        expiredTime: Date.now(),
+      });
+
+      if (!this.tokenResetSwitch) {
+        this.startTokenResetProcess();
+        this.tokenResetSwitch = true;
+      }
+      Logger.info(
+        `模型${modelId}的令牌已失效，已成功移除令牌: ${token}`,
+        "TokenManager"
+      );
+      return true;
+    }
+
+    Logger.error(
+      `在模型 ${normalizedModel} 中未找到 token: ${token}`,
+      "TokenManager"
+    );
+    return false;
+  }
+
+  getExpiredTokens() {
+    return Array.from(this.expiredTokens);
+  }
+
+  normalizeModelName(model) {
+    if (
+      model.startsWith("grok-") &&
+      !model.includes("deepsearch") &&
+      !model.includes("reasoning")
+    ) {
+      return model.split("-").slice(0, 2).join("-");
+    }
+    return model;
+  }
+
+  getTokenCountForModel(modelId) {
+    const normalizedModel = this.normalizeModelName(modelId);
+    return this.tokenModelMap[normalizedModel]?.length || 0;
+  }
+
+  getRemainingTokenRequestCapacity() {
+    const remainingCapacityMap = {};
+
+    Object.keys(this.modelConfig).forEach((model) => {
+      const modelTokens = this.tokenModelMap[model] || [];
+
+      const modelRequestFrequency = this.modelConfig[model].RequestFrequency;
+
+      const totalUsedRequests = modelTokens.reduce((sum, tokenEntry) => {
+        return sum + (tokenEntry.RequestCount || 0);
+      }, 0);
+
+      // 计算剩余可用请求数量
+      const remainingCapacity =
+        modelTokens.length * modelRequestFrequency - totalUsedRequests;
+      remainingCapacityMap[model] = Math.max(0, remainingCapacity);
+    });
+
+    return remainingCapacityMap;
+  }
+
+  getTokenArrayForModel(modelId) {
+    const normalizedModel = this.normalizeModelName(modelId);
+    return this.tokenModelMap[normalizedModel] || [];
+  }
+
+  startTokenResetProcess() {
+    if (this.tokenResetTimer) {
+      clearInterval(this.tokenResetTimer);
+    }
+
+    this.tokenResetTimer = setInterval(() => {
+      const now = Date.now();
+
+      this.expiredTokens.forEach((expiredTokenInfo) => {
+        const { token, model, expiredTime } = expiredTokenInfo;
+        const expirationTime = this.modelConfig[model].ExpirationTime;
+        if (now - expiredTime >= expirationTime) {
+          if (
+            !this.tokenModelMap[model].some((entry) => entry.token === token)
+          ) {
+            this.tokenModelMap[model].push({
+              token: token,
+              RequestCount: 0,
+              AddedTime: now,
+              StartCallTime: null,
+            });
+          }
+          const sso = token.split("sso=")[1].split(";")[0];
+
+          if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][model]) {
+            this.tokenStatusMap[sso][model].isValid = true;
+            this.tokenStatusMap[sso][model].invalidatedTime = null;
+            this.tokenStatusMap[sso][model].totalRequestCount = 0;
+          }
+
+          this.expiredTokens.delete(expiredTokenInfo);
+        }
+      });
+
+      Object.keys(this.modelConfig).forEach((model) => {
+        if (!this.tokenModelMap[model]) return;
+
+        const processedTokens = this.tokenModelMap[model].map((tokenEntry) => {
+          if (!tokenEntry.StartCallTime) return tokenEntry;
+
+          const expirationTime = this.modelConfig[model].ExpirationTime;
+          if (now - tokenEntry.StartCallTime >= expirationTime) {
+            const sso = tokenEntry.token.split("sso=")[1].split(";")[0];
+            if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][model]) {
+              this.tokenStatusMap[sso][model].isValid = true;
+              this.tokenStatusMap[sso][model].invalidatedTime = null;
+              this.tokenStatusMap[sso][model].totalRequestCount = 0;
+            }
+
+            return {
+              ...tokenEntry,
+              RequestCount: 0,
+              StartCallTime: null,
+            };
+          }
+
+          return tokenEntry;
+        });
+
+        this.tokenModelMap[model] = processedTokens;
+      });
+    }, 1 * 60 * 60 * 1000);
+  }
+
+  getAllTokens() {
+    const allTokens = new Set();
+    Object.values(this.tokenModelMap).forEach((modelTokens) => {
+      modelTokens.forEach((entry) => allTokens.add(entry.token));
+    });
+    return Array.from(allTokens);
+  }
+
+  getTokenStatusMap() {
+    return this.tokenStatusMap;
   }
 }
 
 class Utils {
-  static async extractGrokHeaders() {
-    Logger.info("开始提取头信息", "Server");
-    try {
-      const browser = await puppeteer.launch({
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu",
-        ],
-        executablePath: CONFIG.CHROME_PATH,
-      });
-
-      const page = await browser.newPage();
-      await page.goto("https://grok.com/", { waitUntil: "domcontentloaded" });
-      await page.evaluate(() => {
-        return new Promise((resolve) => setTimeout(resolve, 5000));
-      });
-      // 获取所有 Cookies
-      const cookies = await page.cookies();
-      const targetHeaders = ["x-anonuserid", "x-challenge", "x-signature"];
-      const extractedHeaders = {};
-      for (const cookie of cookies) {
-        if (targetHeaders.includes(cookie.name.toLowerCase())) {
-          extractedHeaders[cookie.name.toLowerCase()] = cookie.value;
-        }
-      }
-      await browser.close();
-      Logger.info(
-        "提取的头信息:",
-        JSON.stringify(extractedHeaders, null, 2),
-        "Server"
-      );
-      return extractedHeaders;
-    } catch (error) {
-      Logger.error("获取头信息出错:", error, "Server");
-      return null;
-    }
-  }
-  static async get_signature() {
-    if (CONFIG.API.TEMP_COOKIE) {
-      return CONFIG.API.TEMP_COOKIE;
-    }
-    Logger.info("刷新认证信息", "Server");
-    let retryCount = 0;
-    while (!CONFIG.API.TEMP_COOKIE || retryCount < CONFIG.RETRY.MAX_ATTEMPTS) {
-      let headers = await Utils.extractGrokHeaders();
-      if (headers) {
-        Logger.info("获取认证信息成功", "Server");
-        CONFIG.API.TEMP_COOKIE = {
-          cookie: `x-anonuserid=${headers["x-anonuserid"]}; x-challenge=${headers["x-challenge"]}; x-signature=${headers["x-signature"]}`,
-        };
-        return;
-      }
-      retryCount++;
-      if (retryCount >= CONFIG.RETRY.MAX_ATTEMPTS) {
-        throw new Error(`获取认证信息失败!`);
-      }
-    }
+  static delay(time) {
+    return new Promise(function (resolve) {
+      setTimeout(resolve, time);
+    });
   }
   static async organizeSearchResults(searchResults) {
     // 确保传入的是有效的搜索结果对象
@@ -296,9 +552,145 @@ class Utils {
     return formattedResults.join("\n\n");
   }
   static async createAuthHeaders(model) {
-    return {
-      cookie: `${await tokenManager.getTokenByIndex(CONFIG.SSO_INDEX, model)}`,
+    return await tokenManager.getNextTokenForModel(model);
+  }
+}
+class GrokTempCookieManager {
+  constructor() {
+    this.cookies = [];
+    this.currentIndex = 0;
+    this.isRefreshing = false;
+    this.initialCookieCount = CONFIG.API.GROK2_CONCURRENCY_LEVEL;
+    this.extractCount = 0;
+  }
+
+  async ensureCookies() {
+    // 如果 cookies 数量不足，则重新获取
+    if (this.cookies.length < this.initialCookieCount) {
+      await this.refreshCookies();
+    }
+  }
+  async extractGrokHeaders(browser) {
+    Logger.info("开始提取头信息", "Server");
+    try {
+      const page = await browser.newPage();
+      await page.goto("https://grok.com/", { waitUntil: "domcontentloaded" });
+      let waitTime = 0;
+      const targetHeaders = ["x-anonuserid", "x-challenge", "x-signature"];
+
+      while (true) {
+        const cookies = await page.cookies();
+        const extractedHeaders = cookies
+          .filter((cookie) => targetHeaders.includes(cookie.name.toLowerCase()))
+          .map((cookie) => `${cookie.name}=${cookie.value}`);
+
+        if (
+          targetHeaders.every((header) =>
+            extractedHeaders.some(
+              (cookie) => cookie && cookie.startsWith(header + "=")
+            )
+          )
+        ) {
+          await browser.close();
+          Logger.info(
+            "提取的头信息:",
+            JSON.stringify(extractedHeaders, null, 2),
+            "Server"
+          );
+          this.cookies.push(extractedHeaders.join(";"));
+          this.extractCount++;
+          return true;
+        }
+
+        await Utils.delay(500);
+        waitTime += 500;
+        if (waitTime >= 10000) {
+          await browser.close();
+          return null;
+        }
+      }
+    } catch (error) {
+      Logger.error("获取头信息出错:", error, "Server");
+      return null;
+    }
+  }
+  async initializeTempCookies(count = 1) {
+    Logger.info(`开始初始化 ${count} 个临时账号认证信息`, "Server");
+    const browserOptions = {
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+      ],
+      executablePath: CONFIG.CHROME_PATH,
     };
+
+    const browsers = await Promise.all(
+      Array.from({ length: count }, () => puppeteer.launch(browserOptions))
+    );
+
+    const cookiePromises = browsers.map((browser) =>
+      this.extractGrokHeaders(browser)
+    );
+    return Promise.all(cookiePromises);
+  }
+  async refreshCookies() {
+    if (this.isRefreshing) return;
+    this.isRefreshing = true;
+    this.extractCount = 0;
+    try {
+      // 获取新的 cookies
+      let retryCount = 0;
+      let remainingCount = this.initialCookieCount - this.cookies.length;
+
+      while (retryCount < CONFIG.RETRY.MAX_ATTEMPTS) {
+        await this.initializeTempCookies(remainingCount);
+        if (this.extractCount != remainingCount) {
+          if (this.extractCount == 0) {
+            Logger.error(
+              `无法获取足够的有效 TempCookies，可能网络存在问题，当前数量：${this.cookies.length}`
+            );
+          } else if (this.extractCount < remainingCount) {
+            remainingCount -= this.extractCount;
+            this.extractCount = 0;
+            retryCount++;
+            await Utils.delay(1000 * retryCount);
+          } else {
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+      if (this.currentIndex >= this.cookies.length) {
+        this.currentIndex = 0;
+      }
+
+      if (this.cookies.length < this.initialCookieCount) {
+        if (this.cookies.length !== 0) {
+          // 如果已经获取到一些 TempCookies，则只提示警告错误
+          Logger.error(
+            `无法获取足够的有效 TempCookies，可能网络存在问题，当前数量：${this.cookies.length}`
+          );
+        } else {
+          // 如果未获取到任何 TempCookies，则抛出错误
+          throw new Error(
+            `无法获取足够的有效 TempCookies，可能网络存在问题，当前数量：${this.cookies.length}`
+          );
+        }
+      }
+    } catch (error) {
+      Logger.error("刷新 cookies 失败:", error);
+    } finally {
+      Logger.info(`已提取${this.cookies.length}个TempCookies`, "Server");
+      Logger.info(
+        `提取的TempCookies为${JSON.stringify(this.cookies, null, 2)}`,
+        "Server"
+      );
+      this.isRefreshing = false;
+    }
   }
 }
 
@@ -358,7 +750,7 @@ class GrokApiClient {
         method: "POST",
         headers: {
           ...CONFIG.DEFAULT_HEADERS,
-          ...CONFIG.API.SIGNATURE_COOKIE,
+          cookie: CONFIG.API.SIGNATURE_COOKIE,
         },
         body: JSON.stringify(uploadData),
       });
@@ -388,7 +780,7 @@ class GrokApiClient {
       !CONFIG.API.TUMY_KEY &&
       request.stream
     ) {
-      throw new Error(`该模型流式输出需要配置PICGO或者PICUI图床密钥!`);
+      throw new Error(`该模型流式输出需要配置PICGO或者TUMY图床密钥!`);
     }
 
     // 处理画图模型的消息限制
@@ -493,6 +885,7 @@ class GrokApiClient {
     }
 
     return {
+      temporary: CONFIG.API.IS_TEMP_CONVERSATION,
       modelName: this.modelId,
       message: messages.trim(),
       fileAttachments: fileAttachments.slice(0, 4),
@@ -564,11 +957,11 @@ class MessageProcessor {
     };
   }
 }
-async function processModelResponse(linejosn, model) {
+async function processModelResponse(response, model) {
   let result = { token: null, imageUrl: null };
   if (CONFIG.IS_IMG_GEN) {
-    if (linejosn?.cachedImageGenerationResponse && !CONFIG.IS_IMG_GEN2) {
-      result.imageUrl = linejosn.cachedImageGenerationResponse.imageUrl;
+    if (response?.cachedImageGenerationResponse && !CONFIG.IS_IMG_GEN2) {
+      result.imageUrl = response.cachedImageGenerationResponse.imageUrl;
     }
     return result;
   }
@@ -576,37 +969,37 @@ async function processModelResponse(linejosn, model) {
   //非生图模型的处理
   switch (model) {
     case "grok-2":
-      result.token = linejosn?.token;
+      result.token = response?.token;
       return result;
     case "grok-2-search":
     case "grok-3-search":
-      if (linejosn?.webSearchResults && CONFIG.ISSHOW_SEARCH_RESULTS) {
+      if (response?.webSearchResults && CONFIG.ISSHOW_SEARCH_RESULTS) {
         result.token = `\r\n<think>${await Utils.organizeSearchResults(
-          linejosn.webSearchResults
+          response.webSearchResults
         )}</think>\r\n`;
       } else {
-        result.token = linejosn?.token;
+        result.token = response?.token;
       }
       return result;
     case "grok-3":
-      result.token = linejosn?.token;
+      result.token = response?.token;
       return result;
     case "grok-3-deepsearch":
-      if (linejosn.messageTag === "final") {
-        result.token = linejosn?.token;
+      if (response?.messageTag === "final") {
+        result.token = response?.token;
       }
       return result;
     case "grok-3-reasoning":
-      if (linejosn?.isThinking && !CONFIG.SHOW_THINKING) return result;
+      if (response?.isThinking && !CONFIG.SHOW_THINKING) return result;
 
-      if (linejosn?.isThinking && !CONFIG.IS_THINKING) {
-        result.token = "<think>" + linejosn?.token;
+      if (response?.isThinking && !CONFIG.IS_THINKING) {
+        result.token = "<think>" + response?.token;
         CONFIG.IS_THINKING = true;
-      } else if (!linejosn.isThinking && CONFIG.IS_THINKING) {
-        result.token = "</think>" + linejosn?.token;
+      } else if (!response.isThinking && CONFIG.IS_THINKING) {
+        result.token = "</think>" + response?.token;
         CONFIG.IS_THINKING = false;
       } else {
-        result.token = linejosn?.token;
+        result.token = response?.token;
       }
       return result;
   }
@@ -624,6 +1017,9 @@ async function handleResponse(response, model, res, isStream) {
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
     }
+    CONFIG.IS_THINKING = false;
+    CONFIG.IS_IMG_GEN = false;
+    CONFIG.IS_IMG_GEN2 = false;
     Logger.info("开始处理流式响应", "Server");
 
     return new Promise((resolve, reject) => {
@@ -634,68 +1030,64 @@ async function handleResponse(response, model, res, isStream) {
 
         for (const line of lines) {
           if (!line.trim()) continue;
-          const trimmedLine = line.trim();
-          if (trimmedLine.startsWith("data: ")) {
-            const data = trimmedLine.substring(6);
-            try {
-              if (!data.trim()) continue;
-              if (data === "[DONE]") continue;
-              const linejosn = JSON.parse(data);
-              if (linejosn?.error) {
-                Logger.error(JSON.stringify(linejosn, null, 2), "Server");
-                if (linejosn.error?.name === "RateLimitError") {
-                  CONFIG.API.TEMP_COOKIE = null;
-                }
-                stream.destroy();
-                reject(new Error("RateLimitError"));
-                return;
+          try {
+            const linejosn = JSON.parse(line.trim());
+            if (linejosn?.error) {
+              Logger.error(JSON.stringify(linejosn, null, 2), "Server");
+              if (linejosn.error?.name === "RateLimitError") {
+                CONFIG.API.TEMP_COOKIE = null;
               }
-              if (linejosn?.doImgGen || linejosn?.imageAttachmentInfo) {
-                CONFIG.IS_IMG_GEN = true;
-              }
-              const processPromise = (async () => {
-                const result = await processModelResponse(linejosn, model);
-
-                if (result.token) {
-                  if (isStream) {
-                    res.write(
-                      `data: ${JSON.stringify(
-                        MessageProcessor.createChatResponse(
-                          result.token,
-                          model,
-                          true
-                        )
-                      )}\n\n`
-                    );
-                  } else {
-                    fullResponse += result.token;
-                  }
-                }
-                if (result.imageUrl) {
-                  CONFIG.IS_IMG_GEN2 = true;
-                  const dataImage = await handleImageResponse(result.imageUrl);
-                  if (isStream) {
-                    res.write(
-                      `data: ${JSON.stringify(
-                        MessageProcessor.createChatResponse(
-                          dataImage,
-                          model,
-                          true
-                        )
-                      )}\n\n`
-                    );
-                  } else {
-                    res.json(
-                      MessageProcessor.createChatResponse(dataImage, model)
-                    );
-                  }
-                }
-              })();
-              dataPromises.push(processPromise);
-            } catch (error) {
-              Logger.error(error, "Server");
-              continue;
+              stream.destroy();
+              reject(new Error("RateLimitError"));
+              return;
             }
+            let response = linejosn?.result?.response;
+            if (!response) continue;
+            if (response?.doImgGen || response?.imageAttachmentInfo) {
+              CONFIG.IS_IMG_GEN = true;
+            }
+            const processPromise = (async () => {
+              const result = await processModelResponse(response, model);
+
+              if (result.token) {
+                if (isStream) {
+                  res.write(
+                    `data: ${JSON.stringify(
+                      MessageProcessor.createChatResponse(
+                        result.token,
+                        model,
+                        true
+                      )
+                    )}\n\n`
+                  );
+                } else {
+                  fullResponse += result.token;
+                }
+              }
+              if (result.imageUrl) {
+                CONFIG.IS_IMG_GEN2 = true;
+                const dataImage = await handleImageResponse(result.imageUrl);
+                if (isStream) {
+                  res.write(
+                    `data: ${JSON.stringify(
+                      MessageProcessor.createChatResponse(
+                        dataImage,
+                        model,
+                        true
+                      )
+                    )}\n\n`
+                  );
+                } else {
+                  res.json(
+                    MessageProcessor.createChatResponse(dataImage, model)
+                  );
+                }
+              }
+            })();
+            dataPromises.push(processPromise);
+          } catch (error) {
+            Logger.error(error, "Server");
+            continue;
           }
         }
       });
@@ -713,8 +1105,6 @@ async function handleResponse(response, model, res, isStream) {
               );
             }
           }
-          CONFIG.IS_IMG_GEN = false;
-          CONFIG.IS_IMG_GEN2 = false;
           resolve();
         } catch (error) {
           Logger.error(error, "Server");
@@ -729,8 +1119,6 @@ async function handleResponse(response, model, res, isStream) {
     });
   } catch (error) {
     Logger.error(error, "Server");
-    CONFIG.IS_IMG_GEN = false;
-    CONFIG.IS_IMG_GEN2 = false;
     throw new Error(error);
   }
 }
@@ -746,7 +1134,7 @@ async function handleImageResponse(imageUrl) {
         method: "GET",
         headers: {
           ...DEFAULT_HEADERS,
-          ...CONFIG.API.SIGNATURE_COOKIE,
+          cookie: CONFIG.API.SIGNATURE_COOKIE,
         },
       });
 
@@ -837,6 +1225,7 @@ async function handleImageResponse(imageUrl) {
 }
 
 const tokenManager = new AuthTokenManager();
+const tempCookieManager = new GrokTempCookieManager();
 await initialization();
 
 // 中间件配置
@@ -854,10 +1243,58 @@ app.use(
   })
 );
 
+app.get("/get/tokens", (req, res) => {
+  const authToken = req.headers.authorization?.replace("Bearer ", "");
+  if (CONFIG.API.IS_CUSTOM_SSO) {
+    return res
+      .status(403)
+      .json({ error: "自定义的SSO令牌模式无法获取轮询sso令牌状态" });
+  } else if (authToken !== CONFIG.API.API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  res.json(tokenManager.getTokenStatusMap());
+});
+app.post("/add/token", async (req, res) => {
+  const authToken = req.headers.authorization?.replace("Bearer ", "");
+  if (CONFIG.API.IS_CUSTOM_SSO) {
+    return res
+      .status(403)
+      .json({ error: "自定义的SSO令牌模式无法添加sso令牌" });
+  } else if (authToken !== CONFIG.API.API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  try {
+    const sso = req.body.sso;
+    await tokenManager.addToken(`sso-rw=${sso};sso=${sso}`);
+    res.status(200).json(tokenManager.getTokenStatusMap()[sso]);
+  } catch (error) {
+    Logger.error(error, "Server");
+    res.status(500).json({ error: "添加sso令牌失败" });
+  }
+});
+app.post("/delete/token", async (req, res) => {
+  const authToken = req.headers.authorization?.replace("Bearer ", "");
+  if (CONFIG.API.IS_CUSTOM_SSO) {
+    return res
+      .status(403)
+      .json({ error: "自定义的SSO令牌模式无法删除sso令牌" });
+  } else if (authToken !== CONFIG.API.API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  try {
+    const sso = req.body.sso;
+    await tokenManager.deleteToken(`sso-rw=${sso};sso=${sso}`);
+    res.status(200).json({ message: "删除sso令牌成功" });
+  } catch (error) {
+    Logger.error(error, "Server");
+    res.status(500).json({ error: "删除sso令牌失败" });
+  }
+});
+
 app.get("/v1/models", (req, res) => {
   res.json({
     object: "list",
-    data: Object.keys(CONFIG.MODELS).map((model, index) => ({
+    data: Object.keys(tokenManager.tokenModelMap).map((model, index) => ({
       id: model,
       object: "model",
       created: Math.floor(Date.now() / 1000),
@@ -879,61 +1316,38 @@ app.post("/v1/chat/completions", async (req, res) => {
     } else if (authToken !== CONFIG.API.API_KEY) {
       return res.status(401).json({ error: "Unauthorized" });
     }
-    let isTempCookie = req.body.model.includes("grok-2");
-    Logger.info("请求体 Body", req.body, "model");
+    const { model, stream } = req.body;
+    let isTempCookie = model.includes("grok-2") && CONFIG.API.IS_TEMP_GROK2;
     let retryCount = 0;
-    const grokClient = new GrokApiClient(req.body.model);
-    Logger.info("请求体 Boyd", req.body, "Body");
+    const grokClient = new GrokApiClient(model);
     const requestPayload = await grokClient.prepareChatRequest(req.body);
-    Logger.info(`请求体: ${JSON.stringify(requestPayload, null, 2)}`, "Server");
+    //Logger.info(`请求体: ${JSON.stringify(requestPayload, null, 2)}`, 'Server');
 
     while (retryCount < CONFIG.RETRY.MAX_ATTEMPTS) {
       retryCount++;
-      if (!CONFIG.API.TEMP_COOKIE) {
-        await Utils.get_signature();
-      }
-
       if (isTempCookie) {
         CONFIG.API.SIGNATURE_COOKIE = CONFIG.API.TEMP_COOKIE;
         Logger.info(`已切换为临时令牌`, "Server");
       } else {
-        CONFIG.API.SIGNATURE_COOKIE = await Utils.createAuthHeaders(
-          req.body.model
-        );
+        CONFIG.API.SIGNATURE_COOKIE = await Utils.createAuthHeaders(model);
       }
       if (!CONFIG.API.SIGNATURE_COOKIE) {
         throw new Error("该模型无可用令牌");
       }
-      Logger.info(`当前令牌索引: ${CONFIG.SSO_INDEX}`, "Server");
       Logger.info(
         `当前令牌: ${JSON.stringify(CONFIG.API.SIGNATURE_COOKIE, null, 2)}`,
         "Server"
       );
-      const newMessageReq = await fetch(`${CONFIG.API.BASE_URL}/api/rpc`, {
-        method: "POST",
-        headers: {
-          ...DEFAULT_HEADERS,
-          ...CONFIG.API.SIGNATURE_COOKIE,
-        },
-        body: JSON.stringify({
-          rpc: "createConversation",
-          req: {
-            temporary: false,
-          },
-        }),
-      });
-      let conversationId;
-      var responseText2 = await newMessageReq.clone().text();
-      if (newMessageReq.status === 200) {
-        const responseText = await newMessageReq.json();
-        conversationId = responseText.conversationId;
-      } else {
-        Logger.error(`创建会话响应错误: ${responseText2}`, "Server");
-        throw new Error(`创建会话响应错误: ${responseText2}`);
-      }
-
+      Logger.info(
+        `当前可用模型的全部可用数量: ${JSON.stringify(
+          tokenManager.getRemainingTokenRequestCapacity(),
+          null,
+          2
+        )}`,
+        "Server"
+      );
       const response = await fetch(
-        `${CONFIG.API.BASE_URL}/api/conversations/${conversationId}/responses`,
+        `${CONFIG.API.BASE_URL}/rest/app-chat/conversations/new`,
         {
           method: "POST",
           headers: {
@@ -941,7 +1355,7 @@ app.post("/v1/chat/completions", async (req, res) => {
             baggage: "sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c",
             "content-type": "text/plain;charset=UTF-8",
             Connection: "keep-alive",
-            ...CONFIG.API.SIGNATURE_COOKIE,
+            cookie: CONFIG.API.SIGNATURE_COOKIE,
           },
           body: JSON.stringify(requestPayload),
         }
@@ -949,79 +1363,131 @@ app.post("/v1/chat/completions", async (req, res) => {
 
       if (response.ok) {
         Logger.info(`请求成功`, "Server");
-        CONFIG.SSO_INDEX =
-          (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
         Logger.info(
-          `当前剩余可用令牌数: ${tokenManager.getTokenCount()}`,
+          `当前${model}剩余可用令牌数: ${tokenManager.getTokenCountForModel(
+            model
+          )}`,
           "Server"
         );
         try {
-          await handleResponse(response, req.body.model, res, req.body.stream);
+          await handleResponse(response, model, res, stream);
           Logger.info(`请求结束`, "Server");
           return;
         } catch (error) {
           Logger.error(error, "Server");
           if (isTempCookie) {
-            await Utils.get_signature();
-          } else {
-            tokenManager.setModelLimit(CONFIG.SSO_INDEX, req.body.model);
-            for (let i = 1; i <= tokenManager.getTokenCount(); i++) {
-              CONFIG.SSO_INDEX =
-                (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
-              if (
-                !tokenManager.isTokenModelLimitReached(
-                  CONFIG.SSO_INDEX,
-                  req.body.model
-                )
-              ) {
-                break;
-              } else if (i >= tokenManager.getTokenCount()) {
-                throw new Error(
-                  `${req.body.model} 次数已达上限，请切换其他模型或者重新对话`
-                );
+            tempCookieManager.cookies.splice(tempCookieManager.currentIndex, 1);
+            if (tempCookieManager.cookies.length != 0) {
+              tempCookieManager.currentIndex =
+                tempCookieManager.currentIndex %
+                tempCookieManager.cookies.length;
+              CONFIG.API.TEMP_COOKIE =
+                tempCookieManager.cookies[tempCookieManager.currentIndex];
+              tempCookieManager.ensureCookies();
+            } else {
+              try {
+                await tempCookieManager.ensureCookies();
+                tempCookieManager.currentIndex =
+                  tempCookieManager.currentIndex %
+                  tempCookieManager.cookies.length;
+                CONFIG.API.TEMP_COOKIE =
+                  tempCookieManager.cookies[tempCookieManager.currentIndex];
+              } catch (error) {
+                throw error;
               }
+            }
+          } else {
+            if (CONFIG.API.IS_CUSTOM_SSO)
+              throw new Error(`自定义SSO令牌当前模型${model}的请求次数已失效`);
+            tokenManager.removeTokenFromModel(
+              model,
+              CONFIG.API.SIGNATURE_COOKIE.cookie
+            );
+            if (tokenManager.getTokenCountForModel(model) === 0) {
+              throw new Error(
+                `${model} 次数已达上限，请切换其他模型或者重新对话`
+              );
             }
           }
         }
       } else {
         if (response.status === 429) {
           if (isTempCookie) {
-            await Utils.get_signature();
-          } else {
-            tokenManager.setModelLimit(CONFIG.SSO_INDEX, req.body.model);
-            for (let i = 1; i <= tokenManager.getTokenCount(); i++) {
-              CONFIG.SSO_INDEX =
-                (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
-              if (
-                !tokenManager.isTokenModelLimitReached(
-                  CONFIG.SSO_INDEX,
-                  req.body.model
-                )
-              ) {
-                break;
-              } else if (i >= tokenManager.getTokenCount()) {
-                throw new Error(
-                  `${req.body.model} 次数已达上限，请切换其他模型或者重新对话`
-                );
+            // 移除当前失效的 cookie
+            tempCookieManager.cookies.splice(tempCookieManager.currentIndex, 1);
+            if (tempCookieManager.cookies.length != 0) {
+              tempCookieManager.currentIndex =
+                tempCookieManager.currentIndex %
+                tempCookieManager.cookies.length;
+              CONFIG.API.TEMP_COOKIE =
+                tempCookieManager.cookies[tempCookieManager.currentIndex];
+              tempCookieManager.ensureCookies();
+            } else {
+              try {
+                await tempCookieManager.ensureCookies();
+                tempCookieManager.currentIndex =
+                  tempCookieManager.currentIndex %
+                  tempCookieManager.cookies.length;
+                CONFIG.API.TEMP_COOKIE =
+                  tempCookieManager.cookies[tempCookieManager.currentIndex];
+              } catch (error) {
+                throw error;
               }
+            }
+          } else {
+            if (CONFIG.API.IS_CUSTOM_SSO)
+              throw new Error(`自定义SSO令牌当前模型${model}的请求次数已失效`);
+            tokenManager.removeTokenFromModel(
+              model,
+              CONFIG.API.SIGNATURE_COOKIE.cookie
+            );
+            if (tokenManager.getTokenCountForModel(model) === 0) {
+              throw new Error(
+                `${model} 次数已达上限，请切换其他模型或者重新对话`
+              );
             }
           }
         } else {
           // 非429错误直接抛出
           if (isTempCookie) {
-            await Utils.get_signature();
+            // 移除当前失效的 cookie
+            tempCookieManager.cookies.splice(tempCookieManager.currentIndex, 1);
+            if (tempCookieManager.cookies.length != 0) {
+              tempCookieManager.currentIndex =
+                tempCookieManager.currentIndex %
+                tempCookieManager.cookies.length;
+              CONFIG.API.TEMP_COOKIE =
+                tempCookieManager.cookies[tempCookieManager.currentIndex];
+              tempCookieManager.ensureCookies();
+            } else {
+              try {
+                await tempCookieManager.ensureCookies();
+                tempCookieManager.currentIndex =
+                  tempCookieManager.currentIndex %
+                  tempCookieManager.cookies.length;
+                CONFIG.API.TEMP_COOKIE =
+                  tempCookieManager.cookies[tempCookieManager.currentIndex];
+              } catch (error) {
+                throw error;
+              }
+            }
           } else {
+            if (CONFIG.API.IS_CUSTOM_SSO)
+              throw new Error(`自定义SSO令牌当前模型${model}的请求次数已失效`);
             Logger.error(
-              `令牌异常错误状态!status: ${response.status}， 已移除当前令牌${CONFIG.SSO_INDEX.cookie}`,
+              `令牌异常错误状态!status: ${response.status}`,
               "Server"
             );
-            tokenManager.removeTokenByIndex(CONFIG.SSO_INDEX);
+            tokenManager.removeTokenFromModel(
+              model,
+              CONFIG.API.SIGNATURE_COOKIE.cookie
+            );
             Logger.info(
-              `当前剩余可用令牌数: ${tokenManager.getTokenCount()}`,
+              `当前${model}剩余可用令牌数: ${tokenManager.getTokenCountForModel(
+                model
+              )}`,
               "Server"
             );
-            CONFIG.SSO_INDEX =
-              (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
           }
         }
       }
